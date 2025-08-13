@@ -206,35 +206,130 @@ export async function generateVideo(
 
   // 轮询获取结果
   let status = 20, failCode, item_list = [];
-  while (status === 20) {
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    const result = await request("post", "/mweb/v1/get_history_by_ids", refreshToken, {
-      data: {
+  let retryCount = 0;
+  const maxRetries = 60; // 增加重试次数，支持约20分钟的总重试时间
+  
+  // 首次查询前等待更长时间，让服务器有时间处理请求
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+  
+  logger.info(`开始轮询视频生成结果，历史ID: ${historyId}，最大重试次数: ${maxRetries}`);
+  logger.info(`即梦官网API地址: https://jimeng.jianying.com/mweb/v1/get_history_by_ids`);
+  logger.info(`视频生成请求已发送，请同时在即梦官网查看: https://jimeng.jianying.com/ai-tool/video/generate`);
+  
+  while (status === 20 && retryCount < maxRetries) {
+    try {
+      // 构建请求URL和参数
+      const requestUrl = "/mweb/v1/get_history_by_ids";
+      const requestData = {
         history_ids: [historyId],
-      },
-    });
-
-    if (!result.history_list || result.history_list.length === 0)
-      throw new APIException(EX.API_IMAGE_GENERATION_FAILED, "历史记录不存在");
-
-    status = result.history_list[0].status;
-    failCode = result.history_list[0].fail_code;
-    item_list = result.history_list[0].item_list || [];
-
-    if (status === 30) {
-      if (failCode === 2038) {
-        throw new APIException(EX.API_CONTENT_FILTERED, "内容被过滤");
+      };
+      
+      // 尝试两种不同的API请求方式
+      let result;
+      let useAlternativeApi = retryCount > 10 && retryCount % 2 === 0; // 在重试10次后，每隔一次尝试备用API
+      
+      if (useAlternativeApi) {
+        // 备用API请求方式
+        logger.info(`尝试备用API请求方式，URL: ${requestUrl}, 历史ID: ${historyId}, 重试次数: ${retryCount + 1}/${maxRetries}`);
+        const alternativeRequestData = {
+          history_record_ids: [historyId],
+        };
+        result = await request("post", "/mweb/v1/get_history_records", refreshToken, {
+          data: alternativeRequestData,
+        });
+        logger.info(`备用API响应: ${JSON.stringify(result)}`);
       } else {
-        throw new APIException(EX.API_IMAGE_GENERATION_FAILED, `生成失败，错误码: ${failCode}`);
+        // 标准API请求方式
+        logger.info(`发送请求获取视频生成结果，URL: ${requestUrl}, 历史ID: ${historyId}, 重试次数: ${retryCount + 1}/${maxRetries}`);
+        result = await request("post", requestUrl, refreshToken, {
+          data: requestData,
+        });
+        logger.info(`标准API响应摘要: ${JSON.stringify(result).substring(0, 300)}...`);
       }
+      
+
+      // 检查结果是否有效
+      let historyData;
+      
+      if (useAlternativeApi && result.history_records && result.history_records.length > 0) {
+        // 处理备用API返回的数据格式
+        historyData = result.history_records[0];
+        logger.info(`从备用API获取到历史记录`);
+      } else if (result.history_list && result.history_list.length > 0) {
+        // 处理标准API返回的数据格式
+        historyData = result.history_list[0];
+        logger.info(`从标准API获取到历史记录`);
+      } else {
+        // 两种API都没有返回有效数据
+        logger.warn(`历史记录不存在，重试中 (${retryCount + 1}/${maxRetries})... 历史ID: ${historyId}`);
+        logger.info(`请同时在即梦官网检查视频是否已生成: https://jimeng.jianying.com/ai-tool/video/generate`);
+        
+        retryCount++;
+        // 增加重试间隔时间，但设置上限为30秒
+        const waitTime = Math.min(2000 * (retryCount + 1), 30000);
+        logger.info(`等待 ${waitTime}ms 后进行第 ${retryCount + 1} 次重试`);
+        await new Promise((resolve) => setTimeout(resolve, waitTime));
+        continue;
+      }
+      
+      // 记录获取到的结果详情
+      logger.info(`获取到历史记录结果: ${JSON.stringify(historyData)}`);
+      
+
+      // 从历史数据中提取状态和结果
+      status = historyData.status;
+      failCode = historyData.fail_code;
+      item_list = historyData.item_list || [];
+      
+      logger.info(`视频生成状态: ${status}, 失败代码: ${failCode || '无'}, 项目列表长度: ${item_list.length}`);
+      
+      // 如果有视频URL，提前记录
+      const tempVideoUrl = item_list?.[0]?.video?.transcoded_video?.origin?.video_url;
+      if (tempVideoUrl) {
+        logger.info(`检测到视频URL: ${tempVideoUrl}`);
+      }
+
+      if (status === 30) {
+        const error = failCode === 2038 
+          ? new APIException(EX.API_CONTENT_FILTERED, "内容被过滤")
+          : new APIException(EX.API_IMAGE_GENERATION_FAILED, `生成失败，错误码: ${failCode}`);
+        // 添加历史ID到错误对象，以便在chat.ts中显示
+        error.historyId = historyId;
+        throw error;
+      }
+      
+      // 如果状态仍在处理中，等待后继续
+      if (status === 20) {
+        const waitTime = 2000 * (Math.min(retryCount + 1, 5)); // 随着重试次数增加等待时间，但最多10秒
+        logger.info(`视频生成中，状态码: ${status}，等待 ${waitTime}ms 后继续查询`);
+        await new Promise((resolve) => setTimeout(resolve, waitTime));
+      }
+    } catch (error) {
+      logger.error(`轮询视频生成结果出错: ${error.message}`);
+      retryCount++;
+      await new Promise((resolve) => setTimeout(resolve, 2000 * (retryCount + 1)));
     }
+  }
+  
+  // 如果达到最大重试次数仍未成功
+  if (retryCount >= maxRetries && status === 20) {
+    logger.error(`视频生成超时，已尝试 ${retryCount} 次，总耗时约 ${Math.floor(retryCount * 2000 / 1000 / 60)} 分钟`);
+    const error = new APIException(EX.API_IMAGE_GENERATION_FAILED, "获取视频生成结果超时，请稍后在即梦官网查看您的视频");
+    // 添加历史ID到错误对象，以便在chat.ts中显示
+    error.historyId = historyId;
+    throw error;
   }
 
   // 提取视频URL
   const videoUrl = item_list?.[0]?.video?.transcoded_video?.origin?.video_url;
   if (!videoUrl) {
-    throw new APIException(EX.API_IMAGE_GENERATION_FAILED, "未能获取视频URL");
+    logger.error(`未能获取视频URL，item_list: ${JSON.stringify(item_list)}`);
+    const error = new APIException(EX.API_IMAGE_GENERATION_FAILED, "未能获取视频URL，请稍后在即梦官网查看");
+    // 添加历史ID到错误对象，以便在chat.ts中显示
+    error.historyId = historyId;
+    throw error;
   }
 
+  logger.info(`视频生成成功，URL: ${videoUrl}`);
   return videoUrl;
 }

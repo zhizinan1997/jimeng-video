@@ -62,35 +62,64 @@ export async function createCompletion(
 
     // 检查是否为视频生成请求
     if (isVideoModel(_model)) {
-      // 视频生成
-      const videoUrl = await generateVideo(
-        _model,
-        messages[messages.length - 1].content,
-        {
-          width,
-          height,
-          resolution: "720p", // 默认分辨率
-        },
-        refreshToken
-      );
-
-      return {
-        id: util.uuid(),
-        model: _model,
-        object: "chat.completion",
-        choices: [
+      try {
+        // 视频生成
+        logger.info(`开始生成视频，模型: ${_model}`);
+        const videoUrl = await generateVideo(
+          _model,
+          messages[messages.length - 1].content,
           {
-            index: 0,
-            message: {
-              role: "assistant",
-              content: `![video](${videoUrl})\n`,
-            },
-            finish_reason: "stop",
+            width,
+            height,
+            resolution: "720p", // 默认分辨率
           },
-        ],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-        created: util.unixTimestamp(),
-      };
+          refreshToken
+        );
+        
+        logger.info(`视频生成成功，URL: ${videoUrl}`);
+        return {
+          id: util.uuid(),
+          model: _model,
+          object: "chat.completion",
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: "assistant",
+                content: `![video](${videoUrl})\n`,
+              },
+              finish_reason: "stop",
+            },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          created: util.unixTimestamp(),
+        };
+      } catch (error) {
+        logger.error(`视频生成失败: ${error.message}`);
+        // 如果是积分不足等特定错误，直接抛出
+        if (error instanceof APIException) {
+          throw error;
+        }
+        
+        // 其他错误返回友好提示
+        return {
+          id: util.uuid(),
+          model: _model,
+          object: "chat.completion",
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: "assistant",
+                content: `生成视频失败: ${error.message}\n\n如果您在即梦官网看到已生成的视频，可能是获取结果时出现了问题，请前往即梦官网查看。`,
+              },
+              finish_reason: "stop",
+            },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          created: util.unixTimestamp(),
+        };
+      }
     } else {
       // 图像生成
       const imageUrls = await generateImages(
@@ -175,7 +204,7 @@ export async function createCompletionStream(
             choices: [
               {
                 index: 0,
-                delta: { role: "assistant", content: "🎬 视频生成中，请稍候..." },
+                delta: { role: "assistant", content: "🎬 视频生成中，请稍候...\n这可能需要1-2分钟，请耐心等待" },
                 finish_reason: null,
               },
             ],
@@ -183,6 +212,97 @@ export async function createCompletionStream(
           "\n\n"
       );
 
+      // 视频生成
+      logger.info(`开始生成视频，提示词: ${messages[messages.length - 1].content}`);
+      
+      // 发送初始提示
+      stream.write(
+        "data: " +
+          JSON.stringify({
+            id: util.uuid(),
+            model: _model,
+            object: "chat.completion.chunk",
+            choices: [
+              {
+                index: 0,
+                delta: { role: "assistant", content: "🎬 视频生成中，请稍候...\n\n生成过程可能需要几分钟，期间会显示进度点..." },
+                finish_reason: null,
+              },
+            ],
+          }) +
+          "\n\n"
+      );
+      
+      // 进度更新定时器
+      const progressInterval = setInterval(() => {
+        stream.write(
+          "data: " +
+            JSON.stringify({
+              id: util.uuid(),
+              model: _model,
+              object: "chat.completion.chunk",
+              choices: [
+                {
+                  index: 0,
+                  delta: { role: "assistant", content: "." },
+                  finish_reason: null,
+                },
+              ],
+            }) +
+            "\n\n"
+        );
+      }, 5000);
+      
+      // 设置超时，防止无限等待
+      const timeoutId = setTimeout(() => {
+        clearInterval(progressInterval);
+        logger.warn(`视频生成超时（2分钟），提示用户前往即梦官网查看`);
+        stream.write(
+          "data: " +
+            JSON.stringify({
+              id: util.uuid(),
+              model: _model,
+              object: "chat.completion.chunk",
+              choices: [
+                {
+                  index: 1,
+                  delta: {
+                    role: "assistant",
+                    content: "\n\n视频生成时间较长（已等待2分钟），但视频可能仍在生成中。\n\n请前往即梦官网查看您的视频：\n1. 访问 https://jimeng.jianying.com/ai-tool/video/generate\n2. 登录后查看您的创作历史\n3. 如果视频已生成，您可以直接在官网下载或分享\n\n您也可以继续等待，系统将在后台继续尝试获取视频（最长约20分钟）。",
+                  },
+                  finish_reason: "stop",
+                },
+              ],
+            }) +
+            "\n\n"
+        );
+        // 注意：这里不结束流，让后台继续尝试获取视频
+        // stream.end("data: [DONE]\n\n");
+      }, 2 * 60 * 1000); // 2分钟超时显示提示，但继续尝试获取视频
+
+      logger.info(`开始生成视频，模型: ${_model}, 提示词: ${messages[messages.length - 1].content.substring(0, 50)}...`);
+      
+      // 先给用户一个初始提示
+      stream.write(
+        "data: " +
+          JSON.stringify({
+            id: util.uuid(),
+            model: _model,
+            object: "chat.completion.chunk",
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  role: "assistant",
+                  content: "\n\n🎬 视频生成已开始，这可能需要几分钟时间...\n\n您也可以同时在即梦官网查看进度：https://jimeng.jianying.com/ai-tool/video/generate",
+                },
+                finish_reason: null,
+              },
+            ],
+          }) +
+          "\n\n"
+      );
+      
       generateVideo(
         _model,
         messages[messages.length - 1].content,
@@ -190,6 +310,11 @@ export async function createCompletionStream(
         refreshToken
       )
         .then((videoUrl) => {
+          clearInterval(progressInterval);
+          clearTimeout(timeoutId);
+          
+          logger.info(`视频生成成功，URL: ${videoUrl}`);
+          
           stream.write(
             "data: " +
               JSON.stringify({
@@ -201,7 +326,7 @@ export async function createCompletionStream(
                     index: 1,
                     delta: {
                       role: "assistant",
-                      content: `![video](${videoUrl})\n`,
+                      content: `\n\n✅ 视频生成完成！\n\n![video](${videoUrl})\n\n您可以：\n1. 直接查看上方视频\n2. 使用以下链接下载或分享：${videoUrl}\n3. 在即梦官网查看更多选项：https://jimeng.jianying.com/ai-tool/video/generate`,
                     },
                     finish_reason: null,
                   },
@@ -221,7 +346,7 @@ export async function createCompletionStream(
                     index: 2,
                     delta: {
                       role: "assistant",
-                      content: "视频生成完成！",
+                      content: "",
                     },
                     finish_reason: "stop",
                   },
@@ -232,6 +357,33 @@ export async function createCompletionStream(
           stream.end("data: [DONE]\n\n");
         })
         .catch((err) => {
+          clearInterval(progressInterval);
+          clearTimeout(timeoutId);
+          
+          logger.error(`视频生成失败: ${err.message}`);
+          logger.error(`错误详情: ${JSON.stringify(err)}`);
+          
+          // 记录详细错误信息
+          logger.error(`视频生成失败: ${err.message}`);
+          logger.error(`错误详情: ${JSON.stringify(err)}`);
+          
+          // 构建更详细的错误信息
+          let errorMessage = `⚠️ 视频生成过程中遇到问题: ${err.message}`;
+          
+          // 如果是历史记录不存在的错误，提供更具体的建议
+          if (err.message.includes("历史记录不存在")) {
+            errorMessage += "\n\n可能原因：\n1. 视频生成请求已发送，但API无法获取历史记录\n2. 视频生成服务暂时不可用\n3. 历史记录ID无效或已过期\n\n建议操作：\n1. 请前往即梦官网查看您的视频是否已生成：https://jimeng.jianying.com/ai-tool/video/generate\n2. 如果官网已显示视频，但这里无法获取，可能是API连接问题\n3. 如果官网也没有显示，请稍后再试或重新生成视频";
+          } else if (err.message.includes("获取视频生成结果超时")) {
+            errorMessage += "\n\n视频生成可能仍在进行中，但等待时间已超过系统设定的限制。\n\n请前往即梦官网查看您的视频：https://jimeng.jianying.com/ai-tool/video/generate\n\n如果您在官网上看到视频已生成，但这里无法显示，可能是因为：\n1. 获取结果的过程超时\n2. 网络连接问题\n3. API访问限制";
+          } else {
+            errorMessage += "\n\n如果您在即梦官网看到已生成的视频，可能是获取结果时出现了问题。\n\n请访问即梦官网查看您的创作历史：https://jimeng.jianying.com/ai-tool/video/generate";
+          }
+          
+          // 添加历史ID信息，方便用户在官网查找
+          if (err.historyId) {
+            errorMessage += `\n\n历史记录ID: ${err.historyId}（您可以使用此ID在官网搜索您的视频）`;
+          }
+          
           stream.write(
             "data: " +
               JSON.stringify({
@@ -243,7 +395,7 @@ export async function createCompletionStream(
                     index: 1,
                     delta: {
                       role: "assistant",
-                      content: `生成视频失败: ${err.message}`,
+                      content: `\n\n${errorMessage}`,
                     },
                     finish_reason: "stop",
                   },

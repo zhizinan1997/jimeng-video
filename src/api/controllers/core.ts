@@ -149,39 +149,106 @@ export async function request(
   const sign = util.md5(
     `9e2c|${uri.slice(-7)}|${PLATFORM_CODE}|${VERSION_CODE}|${deviceTime}||11ac`
   );
-  const response = await axios.request({
-    method,
-    url: `https://jimeng.jianying.com${uri}`,
-    params: {
-      aid: DEFAULT_ASSISTANT_ID,
-      device_platform: "web",
-      region: "CN",
-      web_id: WEB_ID,
-      ...(options.params || {}),
-    },
-    headers: {
-      ...FAKE_HEADERS,
-      Cookie: generateCookie(token),
-      "Device-Time": deviceTime,
-      Sign: sign,
-      "Sign-Ver": "1",
-      ...(options.headers || {}),
-    },
-    timeout: 15000,
-    validateStatus: () => true,
-    ..._.omit(options, "params", "headers"),
-  });
-  // 流式响应直接返回response
-  if (options.responseType == "stream") return response;
-  return checkResult(response);
-}
-
-/**
- * 预检查文件URL有效性
- *
- * @param fileUrl 文件URL
- */
-export async function checkFileUrl(fileUrl: string) {
+  
+  const fullUrl = `https://jimeng.jianying.com${uri}`;
+  const requestParams = {
+    aid: DEFAULT_ASSISTANT_ID,
+    device_platform: "web",
+    region: "CN",
+    web_id: WEB_ID,
+    ...(options.params || {}),
+  };
+  
+  const headers = {
+    ...FAKE_HEADERS,
+    Cookie: generateCookie(token),
+    "Device-Time": deviceTime,
+    Sign: sign,
+    "Sign-Ver": "1",
+    ...(options.headers || {}),
+  };
+  
+  logger.info(`发送请求: ${method.toUpperCase()} ${fullUrl}`);
+  logger.info(`请求参数: ${JSON.stringify(requestParams)}`);
+  logger.info(`请求数据: ${JSON.stringify(options.data || {})}`);
+  
+  // 添加重试逻辑
+  let retries = 0;
+  const maxRetries = 3; // 最大重试次数
+  let lastError = null;
+  
+  while (retries <= maxRetries) {
+    try {
+      if (retries > 0) {
+        logger.info(`第 ${retries} 次重试请求: ${method.toUpperCase()} ${fullUrl}`);
+        // 重试前等待一段时间
+        await new Promise(resolve => setTimeout(resolve, 1000 * retries));
+      }
+      
+      const response = await axios.request({
+        method,
+        url: fullUrl,
+        params: requestParams,
+        headers: headers,
+        timeout: 45000, // 增加超时时间到45秒
+        validateStatus: () => true, // 允许任何状态码
+        ..._.omit(options, "params", "headers"),
+      });
+      
+      // 记录响应状态和头信息
+      logger.info(`响应状态: ${response.status} ${response.statusText}`);
+      
+      // 流式响应直接返回response
+      if (options.responseType == "stream") return response;
+      
+      // 记录响应数据摘要
+      const responseDataSummary = JSON.stringify(response.data).substring(0, 500) + 
+        (JSON.stringify(response.data).length > 500 ? "..." : "");
+      logger.info(`响应数据摘要: ${responseDataSummary}`);
+      
+      // 检查HTTP状态码
+      if (response.status >= 400) {
+        logger.warn(`HTTP错误: ${response.status} ${response.statusText}`);
+        if (retries < maxRetries) {
+          retries++;
+          continue;
+        }
+      }
+      
+      return checkResult(response);
+    }
+    catch (error) {
+      lastError = error;
+      logger.error(`请求失败 (尝试 ${retries + 1}/${maxRetries + 1}): ${error.message}`);
+      
+      // 如果是网络错误或超时，尝试重试
+      if ((error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT' || 
+           error.message.includes('timeout') || error.message.includes('network')) && 
+          retries < maxRetries) {
+        retries++;
+        continue;
+      }
+      
+      // 其他错误直接抛出
+      break;
+    }
+  }
+  
+  // 所有重试都失败了，抛出最后一个错误
+  logger.error(`请求失败，已重试 ${retries} 次: ${lastError.message}`);
+  if (lastError.response) {
+    logger.error(`响应状态: ${lastError.response.status}`);
+    logger.error(`响应数据: ${JSON.stringify(lastError.response.data)}`);
+  }
+   throw lastError;
+ }
+ 
+ /**
+  * 预检查文件URL有效性
+  *
+  * @param fileUrl 文件URL
+  */
+ export async function checkFileUrl(fileUrl: string) {
   if (util.isBASE64Data(fileUrl)) return;
   const result = await axios.head(fileUrl, {
     timeout: 15000,
